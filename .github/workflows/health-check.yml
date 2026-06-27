@@ -23,6 +23,8 @@ jobs:
             "include": [
               { "name": "Vyla",         "url": "https://missourimonster-vyla.hf.space" },
               { "name": "Vyla-v2",      "url": "https://missourimonster-vyla-v2.hf.space" },
+              { "name": "Vyla-v3",      "url": "https://missourimonster-vyla-v3.hf.space" },
+              { "name": "Vyla-v4",      "url": "https://missourimonster-vyla-v4.hf.space" },
               { "name": "Movieslay",    "url": "https://missourimonster-movieslay.hf.space" },
               { "name": "StreamHub-v1", "url": "https://StreamHubAPI-v1.hf.space" },
               { "name": "StreamHub-v2", "url": "https://StreamHubAPI-v2.hf.space" },
