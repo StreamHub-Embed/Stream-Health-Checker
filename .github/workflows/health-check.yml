@@ -22,9 +22,15 @@ jobs:
           MATRIX=$(cat <<'EOF'
           {
             "include": [
-              { "name": "api-gateway",   "url": "https://example.com/events/stream" },
-              { "name": "payments-svc",  "url": "https://payments.example.com/sse/health" },
-              { "name": "notifier",      "url": "https://notify.example.com/status/stream" }
+              { "name": "Vyla",            "url": "missourimonster-vyla.hf.space" },
+              { "name": "Vyla-v2",         "url": "https://missourimonster-vyla-v2.hf.space" },
+              { "name": "Movieslay",       "url": "https://missourimonster-movieslay.hf.space" },
+              { "name": "StreamHub-v1",    "url": "https://StreamHubAPI-v1.hf.space" },
+              { "name": "StreamHub-v2",    "url": "https://StreamHubAPI-v2.hf.space" },
+              { "name": "D3R-v1",          "url": "https://d3rhub-v1.hf.space" },
+              { "name": "D3R-v2",          "url": "https://d3rhub-v2.hf.space" },
+              { "name": "Nuvio-v1",        "url": "https://NuvioHub-v1.hf.space" },
+              { "name": "Nuvio-v2",        "url": "https://NuvioHub-v2.hf.space" }
             ]
           }
           EOF
