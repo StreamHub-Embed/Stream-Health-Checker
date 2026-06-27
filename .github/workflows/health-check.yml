@@ -18,15 +18,20 @@ jobs:
       - name: Define URLs
         id: set-matrix
         run: |
-          # Add / remove URLs here.  Keys become the job display name.
           MATRIX=$(cat <<'EOF'
           {
             "include": [
-              { "name": "nuvio-v1", "url": "https://NuvioHub-v1.hf.space" }
+              { "name": "Vyla",            "url": "missourimonster-vyla.hf.space" },
+              { "name": "Vyla-v2",         "url": "https://missourimonster-vyla-v2.hf.space" },
+              { "name": "Movieslay",       "url": "https://missourimonster-movieslay.hf.space" },
+              { "name": "StreamHub-v1",    "url": "https://StreamHubAPI-v1.hf.space" },
+              { "name": "StreamHub-v2",    "url": "https://StreamHubAPI-v2.hf.space" },
+              { "name": "D3R-v1",          "url": "https://d3rhub-v1.hf.space" },
+              { "name": "D3R-v2",          "url": "https://d3rhub-v2.hf.space" },
+              { "name": "Nuvio-v1",        "url": "https://NuvioHub-v1.hf.space" },
+              { "name": "Nuvio-v2",        "url": "https://NuvioHub-v2.hf.space" }
             ]
           }
-          EOF
-          )
           echo "matrix=$(echo "$MATRIX" | jq -c .)" >> "$GITHUB_OUTPUT"
 
   # ─────────────────────────────────────────────
@@ -37,7 +42,7 @@ jobs:
     needs: matrix-setup
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false          # let every job finish even if one fails
+      fail-fast: false
       matrix: ${{ fromJson(needs.matrix-setup.outputs.matrix) }}
 
     steps:
@@ -46,24 +51,20 @@ jobs:
         env:
           TARGET_URL: ${{ matrix.url }}
           TARGET_NAME: ${{ matrix.name }}
-          # Optional: add secrets for auth headers, e.g.:
-          # AUTH_TOKEN: ${{ secrets.SSE_AUTH_TOKEN }}
         run: |
-          set -euo pipefail
+          # NOT using set -euo pipefail here — we handle errors explicitly
+          # so that curl/grep/jq failures don't kill the step prematurely.
 
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           OUTFILE="${TARGET_NAME}-result.json"
+          HEADER_FILE=$(mktemp)
+          BODY_FILE=$(mktemp)
+          EVENTS_FILE=$(mktemp)
+          RAW_SSE_FILE=$(mktemp)
 
           echo "::group::Probing $TARGET_NAME → $TARGET_URL"
 
-          HTTP_STATUS=""
-          RAW_SSE=""
-          ERROR_MSG=""
-          REACHABLE="false"
-
-          HEADER_FILE=$(mktemp)
-          BODY_FILE=$(mktemp)
-
+          # ── Curl the SSE endpoint ─────────────────────────────────────
           HTTP_STATUS=$(curl \
             --silent \
             --no-buffer \
@@ -83,63 +84,82 @@ jobs:
             --header "Sec-Fetch-Site: same-origin" \
             --header "DNT: 1" \
             --compressed \
-            "$TARGET_URL" \
-            2>&1 || true) || HTTP_STATUS="000"
+            "$TARGET_URL" 2>/dev/null) || true
 
-          RAW_SSE=$(cat "$BODY_FILE" 2>/dev/null | head -c 8192 || echo "")
+          # Fallback if curl returned nothing
+          HTTP_STATUS="${HTTP_STATUS:-000}"
 
-          # ── Parse SSE lines into an array ────────────────────────────
-          # Always encode field+value as plain strings via jq to avoid
-          # invalid JSON when data: lines contain non-JSON text.
-          SSE_EVENTS_JSON="[]"
-          if [[ -n "$RAW_SSE" ]]; then
-            PARSED=$(echo "$RAW_SSE" | \
-              grep -E '^(data|event|id|retry):' | \
-              while IFS= read -r line; do
+          # Cap raw body at 8 KB and store safely in a file (avoids all escaping issues)
+          head -c 8192 "$BODY_FILE" > "$RAW_SSE_FILE" 2>/dev/null || true
+
+          # ── Parse SSE lines — no pipelines, no subshells ──────────────
+          # Build a JSON array by iterating line by line in pure bash.
+          # Each SSE field+value is encoded via `jq -cn --arg` (always safe).
+          echo "[" > "$EVENTS_FILE"
+          FIRST_EVENT=true
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            # Only process SSE field lines
+            case "$line" in
+              data:*|event:*|id:*|retry:*)
                 field="${line%%:*}"
                 value="${line#*: }"
-                jq -cn --arg f "$field" --arg v "$value" '{field: $f, value: $v}'
-              done | jq -sc '.' 2>/dev/null || echo "[]")
-            # Safety net: validate the result before using it
-            if echo "$PARSED" | jq -e . >/dev/null 2>&1; then
-              SSE_EVENTS_JSON="$PARSED"
-            fi
+                # jq --arg always produces valid JSON strings — no injection possible
+                ENTRY=$(jq -cn --arg f "$field" --arg v "$value" '{field:$f,value:$v}' 2>/dev/null) || continue
+                if [[ "$FIRST_EVENT" == "true" ]]; then
+                  echo "$ENTRY" >> "$EVENTS_FILE"
+                  FIRST_EVENT=false
+                else
+                  echo ",$ENTRY" >> "$EVENTS_FILE"
+                fi
+              ;;
+            esac
+          done < "$RAW_SSE_FILE"
+          echo "]" >> "$EVENTS_FILE"
+
+          # Validate the events array — reset to [] if malformed
+          if ! jq -e . "$EVENTS_FILE" >/dev/null 2>&1; then
+            echo "[]" > "$EVENTS_FILE"
           fi
 
-          # ── Determine health status ──────────────────────────────────
-          if [[ "$HTTP_STATUS" =~ ^2 ]]; then
-            REACHABLE="true"
-            HEALTH="healthy"
-          elif [[ "$HTTP_STATUS" == "000" ]]; then
-            HEALTH="unreachable"
-            ERROR_MSG="curl could not connect (timeout or DNS failure)"
-          else
-            HEALTH="error"
-            ERROR_MSG="HTTP $HTTP_STATUS"
-          fi
+          # ── Determine health ──────────────────────────────────────────
+          HEALTH="error"
+          ERROR_MSG=""
+          case "$HTTP_STATUS" in
+            2*)
+              HEALTH="healthy"
+              ;;
+            000)
+              HEALTH="unreachable"
+              ERROR_MSG="curl could not connect (timeout or DNS failure)"
+              ;;
+            *)
+              HEALTH="error"
+              ERROR_MSG="HTTP $HTTP_STATUS"
+              ;;
+          esac
 
           echo "::endgroup::"
 
-          # ── Emit step summary ────────────────────────────────────────
-          if [[ "$REACHABLE" == "true" ]]; then
+          # ── Step summary ──────────────────────────────────────────────
+          EVENT_COUNT=$(jq 'length' "$EVENTS_FILE" 2>/dev/null || echo 0)
+
+          if [[ "$HEALTH" == "healthy" ]]; then
             echo "### ✅ $TARGET_NAME — $HEALTH (HTTP $HTTP_STATUS)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "### ❌ $TARGET_NAME — $HEALTH" >> "$GITHUB_STEP_SUMMARY"
             echo "_${ERROR_MSG}_" >> "$GITHUB_STEP_SUMMARY"
           fi
+          {
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| URL | \`$TARGET_URL\` |"
+            echo "| HTTP status | $HTTP_STATUS |"
+            echo "| Probed at | $TIMESTAMP |"
+            echo "| SSE events received | $EVENT_COUNT |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| URL | \`$TARGET_URL\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| HTTP status | $HTTP_STATUS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Probed at | $TIMESTAMP |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SSE events received | $(echo "$SSE_EVENTS_JSON" | jq 'length') |" >> "$GITHUB_STEP_SUMMARY"
-
-          # ── Write JSON artifact ──────────────────────────────────────
-          # Write RAW_SSE via --rawfile to avoid shell-escaping issues
-          RAW_SSE_FILE=$(mktemp)
-          printf '%s' "$RAW_SSE" > "$RAW_SSE_FILE"
-
+          # ── Write JSON artifact ───────────────────────────────────────
+          # --rawfile reads from a file path — no shell escaping at all
           jq -n \
             --arg     name        "$TARGET_NAME" \
             --arg     url         "$TARGET_URL" \
@@ -148,7 +168,7 @@ jobs:
             --arg     health      "$HEALTH" \
             --arg     error       "$ERROR_MSG" \
             --rawfile raw_sse     "$RAW_SSE_FILE" \
-            --argjson events      "$SSE_EVENTS_JSON" \
+            --slurpfile events    "$EVENTS_FILE" \
             '{
               name:        $name,
               url:         $url,
@@ -158,24 +178,24 @@ jobs:
               error:       (if $error == "" then null else $error end),
               sse: {
                 raw_preview: ($raw_sse | .[0:2048]),
-                events:      $events,
-                event_count: ($events | length)
+                events:      $events[0],
+                event_count: ($events[0] | length)
               }
             }' > "$OUTFILE"
 
-          rm -f "$RAW_SSE_FILE"
-
-          echo "Artifact written: $OUTFILE"
+          echo "Artifact written → $OUTFILE"
           cat "$OUTFILE"
 
-          # Fail the step (and thus the job) if not healthy
+          rm -f "$HEADER_FILE" "$BODY_FILE" "$EVENTS_FILE" "$RAW_SSE_FILE"
+
+          # Explicit exit code — no reliance on pipefail
           if [[ "$HEALTH" != "healthy" ]]; then
             echo "::error title=$TARGET_NAME::Probe failed — $HEALTH${ERROR_MSG:+ ($ERROR_MSG)}"
             exit 1
           fi
 
       - name: Upload SSE result
-        if: always()   # upload even on failure so we can inspect errors
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sse-result-${{ matrix.name }}
@@ -201,26 +221,28 @@ jobs:
       - name: Merge into combined report
         run: |
           COMBINED=$(jq -sc '.' results/*.json)
-          echo "$COMBINED" | jq . > combined-report.json
+          echo "$COMBINED" > combined-report.json
 
           TOTAL=$(echo "$COMBINED" | jq 'length')
           HEALTHY=$(echo "$COMBINED" | jq '[.[] | select(.health=="healthy")] | length')
           FAILED=$((TOTAL - HEALTHY))
 
-          echo "## 📊 SSE Health Check — Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| | Count |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ✅ Healthy | $HEALTHY |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ❌ Failed  | $FAILED  |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Total     | $TOTAL   |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "<details><summary>Full JSON report</summary>" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '```json' >> "$GITHUB_STEP_SUMMARY"
-          cat combined-report.json >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## 📊 SSE Health Check — Summary"
+            echo ""
+            echo "| | Count |"
+            echo "|---|---|"
+            echo "| ✅ Healthy | $HEALTHY |"
+            echo "| ❌ Failed  | $FAILED  |"
+            echo "| Total      | $TOTAL   |"
+            echo ""
+            echo "<details><summary>Full JSON report</summary>"
+            echo ""
+            echo '```json'
+            cat combined-report.json
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload combined report
         uses: actions/upload-artifact@v4
