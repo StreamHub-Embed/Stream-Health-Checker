@@ -61,18 +61,29 @@ jobs:
           BODY_FILE=$(mktemp)
           EVENTS_FILE=$(mktemp)
           RAW_SSE_FILE=$(mktemp)
+          CURL_ERROR_FILE=$(mktemp)
 
           echo "::group::Probing $TARGET_NAME → $TARGET_URL"
 
-          # ── Curl the SSE endpoint ─────────────────────────────────────
+          # ── Curl the SSE endpoint (with retry) ───────────────────────
+          # HF Spaces can take 30-60s to wake from sleep, so we:
+          #   - allow 30s connect timeout, 60s total per attempt
+          #   - retry up to 3 times with 15s between attempts
+          #   - follow redirects (HF sometimes redirects to canonical host)
           HTTP_STATUS=$(curl \
             --silent \
             --no-buffer \
-            --max-time 20 \
-            --connect-timeout 8 \
+            --max-time 60 \
+            --connect-timeout 30 \
+            --retry 3 \
+            --retry-delay 15 \
+            --retry-connrefused \
+            --location \
+            --max-redirs 5 \
             --write-out "%{http_code}" \
             --output "$BODY_FILE" \
             --dump-header "$HEADER_FILE" \
+            --stderr "$CURL_ERROR_FILE" \
             --header "Accept: text/event-stream" \
             --header "Cache-Control: no-cache" \
             --header "Connection: keep-alive" \
@@ -84,9 +95,11 @@ jobs:
             --header "Sec-Fetch-Site: same-origin" \
             --header "DNT: 1" \
             --compressed \
-            "$TARGET_URL" 2>/dev/null) || true
+            "$TARGET_URL") || true
 
           HTTP_STATUS="${HTTP_STATUS:-000}"
+          CURL_ERROR=$(cat "$CURL_ERROR_FILE" 2>/dev/null || true)
+          rm -f "$CURL_ERROR_FILE"
 
           head -c 8192 "$BODY_FILE" > "$RAW_SSE_FILE" 2>/dev/null || true
 
@@ -123,7 +136,8 @@ jobs:
               ;;
             000)
               HEALTH="unreachable"
-              ERROR_MSG="curl could not connect (timeout or DNS failure)"
+              # Include the actual curl error so we know WHY it failed
+              ERROR_MSG="curl could not connect — ${CURL_ERROR:-timeout or DNS failure}"
               ;;
             *)
               HEALTH="error"
