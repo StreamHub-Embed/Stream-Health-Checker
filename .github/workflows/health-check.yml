@@ -22,15 +22,7 @@ jobs:
           MATRIX=$(cat <<'EOF'
           {
             "include": [
-              { "name": "Vyla",            "url": "missourimonster-vyla.hf.space" },
-              { "name": "Vyla-v2",         "url": "https://missourimonster-vyla-v2.hf.space" },
-              { "name": "Movieslay",       "url": "https://missourimonster-movieslay.hf.space" },
-              { "name": "StreamHub-v1",    "url": "https://StreamHubAPI-v1.hf.space" },
-              { "name": "StreamHub-v2",    "url": "https://StreamHubAPI-v2.hf.space" },
-              { "name": "D3R-v1",          "url": "https://d3rhub-v1.hf.space" },
-              { "name": "D3R-v2",          "url": "https://d3rhub-v2.hf.space" },
-              { "name": "Nuvio-v1",        "url": "https://NuvioHub-v1.hf.space" },
-              { "name": "Nuvio-v2",        "url": "https://NuvioHub-v2.hf.space" }
+              { "name": "nuvio-v1", "url": "https://NuvioHub-v1.hf.space" }
             ]
           }
           EOF
@@ -64,20 +56,11 @@ jobs:
 
           echo "::group::Probing $TARGET_NAME → $TARGET_URL"
 
-          # ── curl flags ────────────────────────────────────────────────
-          #  -s          silent
-          #  -N          disable buffering (needed for SSE)
-          #  --max-time  total timeout in seconds
-          #  -H          browser-like headers to avoid bot-blocking
-          #  -D -        dump response headers to stdout (captured separately)
-          # ──────────────────────────────────────────────────────────────
-
           HTTP_STATUS=""
           RAW_SSE=""
           ERROR_MSG=""
           REACHABLE="false"
 
-          # Write headers to a temp file, body to another
           HEADER_FILE=$(mktemp)
           BODY_FILE=$(mktemp)
 
@@ -104,19 +87,23 @@ jobs:
             2>&1 || true) || HTTP_STATUS="000"
 
           RAW_SSE=$(cat "$BODY_FILE" 2>/dev/null | head -c 8192 || echo "")
-          RESPONSE_HEADERS=$(cat "$HEADER_FILE" 2>/dev/null || echo "")
 
           # ── Parse SSE lines into an array ────────────────────────────
-          # SSE format:  "data: <payload>\n\n"
+          # Always encode field+value as plain strings via jq to avoid
+          # invalid JSON when data: lines contain non-JSON text.
           SSE_EVENTS_JSON="[]"
           if [[ -n "$RAW_SSE" ]]; then
-            SSE_EVENTS_JSON=$(echo "$RAW_SSE" | \
+            PARSED=$(echo "$RAW_SSE" | \
               grep -E '^(data|event|id|retry):' | \
-              awk -F': ' '{
-                key=$1; val=substr($0, length($1)+3);
-                printf "{\"field\":\"%s\",\"value\":%s}\n", key, (key=="data" ? val : "\"" val "\"")
-              }' 2>/dev/null | \
-              jq -sc '.' 2>/dev/null || echo "[]")
+              while IFS= read -r line; do
+                field="${line%%:*}"
+                value="${line#*: }"
+                jq -cn --arg f "$field" --arg v "$value" '{field: $f, value: $v}'
+              done | jq -sc '.' 2>/dev/null || echo "[]")
+            # Safety net: validate the result before using it
+            if echo "$PARSED" | jq -e . >/dev/null 2>&1; then
+              SSE_EVENTS_JSON="$PARSED"
+            fi
           fi
 
           # ── Determine health status ──────────────────────────────────
@@ -149,15 +136,19 @@ jobs:
           echo "| SSE events received | $(echo "$SSE_EVENTS_JSON" | jq 'length') |" >> "$GITHUB_STEP_SUMMARY"
 
           # ── Write JSON artifact ──────────────────────────────────────
+          # Write RAW_SSE via --rawfile to avoid shell-escaping issues
+          RAW_SSE_FILE=$(mktemp)
+          printf '%s' "$RAW_SSE" > "$RAW_SSE_FILE"
+
           jq -n \
-            --arg name        "$TARGET_NAME" \
-            --arg url         "$TARGET_URL" \
-            --arg timestamp   "$TIMESTAMP" \
-            --arg http_status "$HTTP_STATUS" \
-            --arg health      "$HEALTH" \
-            --arg error       "$ERROR_MSG" \
-            --arg raw_sse     "$RAW_SSE" \
-            --argjson events  "$SSE_EVENTS_JSON" \
+            --arg     name        "$TARGET_NAME" \
+            --arg     url         "$TARGET_URL" \
+            --arg     timestamp   "$TIMESTAMP" \
+            --arg     http_status "$HTTP_STATUS" \
+            --arg     health      "$HEALTH" \
+            --arg     error       "$ERROR_MSG" \
+            --rawfile raw_sse     "$RAW_SSE_FILE" \
+            --argjson events      "$SSE_EVENTS_JSON" \
             '{
               name:        $name,
               url:         $url,
@@ -171,6 +162,8 @@ jobs:
                 event_count: ($events | length)
               }
             }' > "$OUTFILE"
+
+          rm -f "$RAW_SSE_FILE"
 
           echo "Artifact written: $OUTFILE"
           cat "$OUTFILE"
