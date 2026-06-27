@@ -21,17 +21,19 @@ jobs:
           MATRIX=$(cat <<'EOF'
           {
             "include": [
-              { "name": "Vyla",            "url": "missourimonster-vyla.hf.space" },
-              { "name": "Vyla-v2",         "url": "https://missourimonster-vyla-v2.hf.space" },
-              { "name": "Movieslay",       "url": "https://missourimonster-movieslay.hf.space" },
-              { "name": "StreamHub-v1",    "url": "https://StreamHubAPI-v1.hf.space" },
-              { "name": "StreamHub-v2",    "url": "https://StreamHubAPI-v2.hf.space" },
-              { "name": "D3R-v1",          "url": "https://d3rhub-v1.hf.space" },
-              { "name": "D3R-v2",          "url": "https://d3rhub-v2.hf.space" },
-              { "name": "Nuvio-v1",        "url": "https://NuvioHub-v1.hf.space" },
-              { "name": "Nuvio-v2",        "url": "https://NuvioHub-v2.hf.space" }
+              { "name": "Vyla",         "url": "https://missourimonster-vyla.hf.space" },
+              { "name": "Vyla-v2",      "url": "https://missourimonster-vyla-v2.hf.space" },
+              { "name": "Movieslay",    "url": "https://missourimonster-movieslay.hf.space" },
+              { "name": "StreamHub-v1", "url": "https://StreamHubAPI-v1.hf.space" },
+              { "name": "StreamHub-v2", "url": "https://StreamHubAPI-v2.hf.space" },
+              { "name": "D3R-v1",       "url": "https://d3rhub-v1.hf.space" },
+              { "name": "D3R-v2",       "url": "https://d3rhub-v2.hf.space" },
+              { "name": "Nuvio-v1",     "url": "https://NuvioHub-v1.hf.space" },
+              { "name": "Nuvio-v2",     "url": "https://NuvioHub-v2.hf.space" }
             ]
           }
+          EOF
+          )
           echo "matrix=$(echo "$MATRIX" | jq -c .)" >> "$GITHUB_OUTPUT"
 
   # ─────────────────────────────────────────────
@@ -52,9 +54,7 @@ jobs:
           TARGET_URL: ${{ matrix.url }}
           TARGET_NAME: ${{ matrix.name }}
         run: |
-          # NOT using set -euo pipefail here — we handle errors explicitly
-          # so that curl/grep/jq failures don't kill the step prematurely.
-
+          # NOT using set -euo pipefail — errors handled explicitly
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           OUTFILE="${TARGET_NAME}-result.json"
           HEADER_FILE=$(mktemp)
@@ -86,24 +86,18 @@ jobs:
             --compressed \
             "$TARGET_URL" 2>/dev/null) || true
 
-          # Fallback if curl returned nothing
           HTTP_STATUS="${HTTP_STATUS:-000}"
 
-          # Cap raw body at 8 KB and store safely in a file (avoids all escaping issues)
           head -c 8192 "$BODY_FILE" > "$RAW_SSE_FILE" 2>/dev/null || true
 
           # ── Parse SSE lines — no pipelines, no subshells ──────────────
-          # Build a JSON array by iterating line by line in pure bash.
-          # Each SSE field+value is encoded via `jq -cn --arg` (always safe).
           echo "[" > "$EVENTS_FILE"
           FIRST_EVENT=true
           while IFS= read -r line || [[ -n "$line" ]]; do
-            # Only process SSE field lines
             case "$line" in
               data:*|event:*|id:*|retry:*)
                 field="${line%%:*}"
                 value="${line#*: }"
-                # jq --arg always produces valid JSON strings — no injection possible
                 ENTRY=$(jq -cn --arg f "$field" --arg v "$value" '{field:$f,value:$v}' 2>/dev/null) || continue
                 if [[ "$FIRST_EVENT" == "true" ]]; then
                   echo "$ENTRY" >> "$EVENTS_FILE"
@@ -116,7 +110,6 @@ jobs:
           done < "$RAW_SSE_FILE"
           echo "]" >> "$EVENTS_FILE"
 
-          # Validate the events array — reset to [] if malformed
           if ! jq -e . "$EVENTS_FILE" >/dev/null 2>&1; then
             echo "[]" > "$EVENTS_FILE"
           fi
@@ -159,7 +152,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           # ── Write JSON artifact ───────────────────────────────────────
-          # --rawfile reads from a file path — no shell escaping at all
           jq -n \
             --arg     name        "$TARGET_NAME" \
             --arg     url         "$TARGET_URL" \
@@ -188,7 +180,6 @@ jobs:
 
           rm -f "$HEADER_FILE" "$BODY_FILE" "$EVENTS_FILE" "$RAW_SSE_FILE"
 
-          # Explicit exit code — no reliance on pipefail
           if [[ "$HEALTH" != "healthy" ]]; then
             echo "::error title=$TARGET_NAME::Probe failed — $HEALTH${ERROR_MSG:+ ($ERROR_MSG)}"
             exit 1
